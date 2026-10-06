@@ -355,6 +355,12 @@ class CreateSessionRequest(BaseModel):
     version: int = Field(
         ..., ge=1, description="Exact registered protocol version pinned to this session"
     )
+    sequence_audit: bool = Field(
+        False,
+        description="Enable sequence-number continuity auditing for this session; "
+        "the pinned protocol must declare sequence_field naming an unsigned "
+        "integer field with an effective bit width of at least 2",
+    )
 
 
 class SessionAppendRequest(BaseModel):
@@ -364,6 +370,50 @@ class SessionAppendRequest(BaseModel):
     )
     chunk_b64: str = Field(
         ..., min_length=1, description="Non-empty base64 fragment of the arriving raw stream"
+    )
+
+
+class SequenceAnomaly(BaseModel):
+    type: Literal["duplicate", "suspected_gap", "backward", "indeterminate"] = Field(
+        ..., description="How this frame's raw sequence compares to the baseline"
+    )
+    frame_start: int = Field(..., description="Session offset where the anomalous frame starts")
+    frame_end: int = Field(..., description="Session offset where the anomalous frame ends (exclusive)")
+    previous_sequence: int = Field(
+        ..., description="Baseline raw sequence (the previous valid frame)"
+    )
+    sequence: int = Field(..., description="Raw sequence of this frame")
+    missing: int | None = Field(
+        None, description="Inferred missing frame count; only set for suspected_gap"
+    )
+
+
+class SequenceAuditState(BaseModel):
+    bit_width: int = Field(
+        ..., description="Effective bit width of the sequence field; comparison modulus is 2**bit_width"
+    )
+    last_sequence: int | None = Field(
+        ..., description="Raw sequence of the most recent valid frame (the next comparison baseline)"
+    )
+    duplicates: int = Field(..., description="Cumulative anomalies: same sequence as the baseline")
+    suspected_gaps: int = Field(
+        ..., description="Cumulative anomalies: forward jump of 2..half-1 steps"
+    )
+    backwards: int = Field(
+        ..., description="Cumulative anomalies: jump larger than half the modulus"
+    )
+    indeterminates: int = Field(
+        ..., description="Cumulative anomalies: jump of exactly half the modulus"
+    )
+    missing_total: int = Field(
+        ..., description="Cumulative missing frames inferred from suspected gaps"
+    )
+
+
+class SequenceAuditReport(SequenceAuditState):
+    anomalies: list[SequenceAnomaly] = Field(
+        default_factory=list,
+        description="Anomalies confirmed by this append, in frame order",
     )
 
 
@@ -388,6 +438,11 @@ class SessionAppendResponse(BaseModel):
         description="True when the identical chunk at the identical offset is resent: "
         "the stored response is returned verbatim and no frames are produced again",
     )
+    sequence_audit: SequenceAuditReport | None = Field(
+        None,
+        description="Sequence continuity audit for this append; null unless the "
+        "session was created with sequence_audit enabled",
+    )
 
 
 class SessionProgressResponse(BaseModel):
@@ -402,3 +457,8 @@ class SessionProgressResponse(BaseModel):
     last_chunk_sha256: str | None
     created_at: str
     updated_at: str
+    sequence_audit: SequenceAuditState | None = Field(
+        None,
+        description="Cumulative sequence audit state; null unless the session "
+        "was created with sequence_audit enabled",
+    )

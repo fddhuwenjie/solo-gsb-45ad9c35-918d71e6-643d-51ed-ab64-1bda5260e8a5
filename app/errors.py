@@ -63,6 +63,11 @@ class SessionAppendConflictError(APIError):
     code = "SESSION_APPEND_CONFLICT"
 
 
+class SequenceAuditUnsupportedError(APIError):
+    status_code = 422
+    code = "SEQUENCE_AUDIT_UNSUPPORTED"
+
+
 class FieldOutOfBoundsError(DecodeError):
     code = "FIELD_OUT_OF_BOUNDS"
 

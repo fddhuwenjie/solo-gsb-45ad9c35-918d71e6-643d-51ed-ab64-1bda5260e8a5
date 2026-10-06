@@ -13,6 +13,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
+from .audit import (
+    BACKWARD,
+    DUPLICATE,
+    INDETERMINATE,
+    MIN_BIT_WIDTH,
+    SUSPECTED_GAP,
+    audit_frames,
+    sequence_bit_width,
+)
 from .config import Settings, get_settings
 from .db import Database
 from .decoder import decode_stream
@@ -23,6 +32,7 @@ from .errors import (
     PayloadTooLargeError,
     ProtocolNotFoundError,
     ProtocolVersionConflictError,
+    SequenceAuditUnsupportedError,
     SessionAppendConflictError,
     SessionNotFoundError,
 )
@@ -351,10 +361,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise ProtocolNotFoundError(
                 message=f"protocol '{req.protocol_id}' version {req.version} not found"
             )
-        _proto, resolved_version = found
+        proto, resolved_version = found
+
+        # Optional sequence continuity audit: the pinned protocol must declare
+        # an unsigned integer sequence field of at least MIN_BIT_WIDTH
+        # effective bits, otherwise the session is refused.
+        audit_bit_width: int | None = None
+        if req.sequence_audit:
+            audit_bit_width = sequence_bit_width(proto)
+            if audit_bit_width is None or audit_bit_width < MIN_BIT_WIDTH:
+                raise SequenceAuditUnsupportedError(
+                    message=(
+                        "sequence audit requires the pinned protocol to declare "
+                        "sequence_field naming an unsigned integer field with an "
+                        f"effective bit width of at least {MIN_BIT_WIDTH}"
+                    ),
+                    details={
+                        "protocol_id": proto.protocol_id,
+                        "version": resolved_version,
+                        "sequence_field": proto.sequence_field,
+                        "bit_width": audit_bit_width,
+                        "min_bit_width": MIN_BIT_WIDTH,
+                    },
+                )
+
         session_id = uuid.uuid4().hex
-        db.create_session(session_id, req.protocol_id, resolved_version)
-        return {
+        db.create_session(
+            session_id,
+            req.protocol_id,
+            resolved_version,
+            audit_enabled=req.sequence_audit,
+            audit_bit_width=audit_bit_width,
+        )
+        response = {
             "session_id": session_id,
             "protocol_id": req.protocol_id,
             "version": resolved_version,
@@ -363,6 +402,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "tail": {"start": 0, "end": 0, "payload_b64": ""},
             "frames_total": 0,
         }
+        if req.sequence_audit:
+            response["sequence_audit"] = {
+                "bit_width": audit_bit_width,
+                "last_sequence": None,
+                "duplicates": 0,
+                "suspected_gaps": 0,
+                "backwards": 0,
+                "indeterminates": 0,
+                "missing_total": 0,
+            }
+        return response
 
     @app.post("/sessions/append", response_model=SessionAppendResponse)
     async def session_append(req: SessionAppendRequest) -> dict:
@@ -425,6 +475,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             base = received_offset - len(pending_tail)
             _shift_to_session(result, base)
 
+            # Optional sequence continuity audit: only frames confirmed by
+            # this append are judged, in order, against the persisted
+            # baseline; every valid frame then becomes the next baseline.
+            # Bad frames and the pending tail never reach this point.
+            audit_enabled = bool(row["audit_enabled"])
+            audit_last_sequence = row["audit_last_sequence"]
+            audit_duplicates = row["audit_duplicates"]
+            audit_suspected_gaps = row["audit_suspected_gaps"]
+            audit_backwards = row["audit_backwards"]
+            audit_indeterminates = row["audit_indeterminates"]
+            audit_missing_total = row["audit_missing_total"]
+            anomalies: list[dict] = []
+            if audit_enabled:
+                anomalies, audit_last_sequence, deltas = audit_frames(
+                    result["frames"], audit_last_sequence, row["audit_bit_width"]
+                )
+                audit_duplicates += deltas[DUPLICATE]
+                audit_suspected_gaps += deltas[SUSPECTED_GAP]
+                audit_backwards += deltas[BACKWARD]
+                audit_indeterminates += deltas[INDETERMINATE]
+                audit_missing_total += deltas["missing"]
+
             new_tail_b64 = result["tail"]["payload_b64"]
             new_frames_total = frames_total + len(result["frames"])
             new_offset = received_offset + len(chunk)
@@ -441,14 +513,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "frame_count": len(result["frames"]),
                 "frames_total": new_frames_total,
                 "replayed": False,
+                "sequence_audit": (
+                    {
+                        "bit_width": row["audit_bit_width"],
+                        "last_sequence": audit_last_sequence,
+                        "anomalies": anomalies,
+                        "duplicates": audit_duplicates,
+                        "suspected_gaps": audit_suspected_gaps,
+                        "backwards": audit_backwards,
+                        "indeterminates": audit_indeterminates,
+                        "missing_total": audit_missing_total,
+                    }
+                    if audit_enabled
+                    else None
+                ),
             }
             validated = SessionAppendResponse.model_validate(response)
 
-            # Offset, tail, frame count, last chunk and this response commit
-            # as one state, guarded by the offset this append was computed
-            # from. On error above (too large / decode failure) nothing here
-            # runs, so the offset does not advance; when the guard fails,
-            # another instance committed first and nothing is written either.
+            # Offset, tail, frame count, last chunk, this response and the
+            # audit state commit as one state, guarded by the offset this
+            # append was computed from. On error above (too large / decode
+            # failure) nothing here runs, so neither the offset nor the audit
+            # baseline advances; when the guard fails, another instance
+            # committed first and nothing is written either.
             committed = db.save_session_append(
                 req.session_id,
                 expected_received_offset=received_offset,
@@ -458,6 +545,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 last_chunk_offset=received_offset,
                 last_chunk_sha=chunk_sha,
                 last_response_json=validated.model_dump_json(),
+                audit_last_sequence=audit_last_sequence,
+                audit_duplicates=audit_duplicates,
+                audit_suspected_gaps=audit_suspected_gaps,
+                audit_backwards=audit_backwards,
+                audit_indeterminates=audit_indeterminates,
+                audit_missing_total=audit_missing_total,
             )
             if not committed:
                 # Lost the race against another instance sharing this
@@ -491,6 +584,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise SessionNotFoundError(message=f"session '{session_id}' not found")
         tail_bytes = base64.b64decode(row["tail_b64"]) if row["tail_b64"] else b""
         tail_start = row["received_offset"] - len(tail_bytes)
+        audit = None
+        if row["audit_enabled"]:
+            audit = {
+                "bit_width": row["audit_bit_width"],
+                "last_sequence": row["audit_last_sequence"],
+                "duplicates": row["audit_duplicates"],
+                "suspected_gaps": row["audit_suspected_gaps"],
+                "backwards": row["audit_backwards"],
+                "indeterminates": row["audit_indeterminates"],
+                "missing_total": row["audit_missing_total"],
+            }
         return {
             "session_id": session_id,
             "protocol_id": row["protocol_id"],
@@ -507,6 +611,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "last_chunk_sha256": row["last_chunk_sha256"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "sequence_audit": audit,
         }
 
     return app
