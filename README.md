@@ -26,6 +26,15 @@
   compare-and-swap 落库，**多个服务实例共用同一 SQLite 文件**时竞争追加也不会互相覆盖。
 - **丢弃区间审计**：每次跳过都返回 `[start, end)` 区间与各候选的失败原因
   （`length_out_of_bounds` / `crc_failed` / `malformed_escape`）。
+- **序号连续性稽核（可选）** `POST /sessions` 传 `"enable_sequence_audit": true`：
+  创建时校验协议声明了**有效位宽至少两位的无符号整数** `sequence_field`（整字节无符号
+  字段或 ≥2 位的无符号位域），否则 422 拒绝创建。每次成功追加只对**本次新确认的有效帧**
+  按位宽取模与上一帧比较：相同→`duplicate`；前进超过一步且**小于半圈**→`suspected_gap`
+  并给出 `missing_count`；**超过半圈**→`backward`；**恰好半圈**→`direction_unknown`
+  （后两者不推断缺帧）。每个有效帧（含异常帧）都成为下一帧的比较基准，坏帧与未决尾部不
+  改变基准。追加响应返回本次异常的帧偏移、前后序号与类型，进度查询给出最近序号与各类累计
+  异常次数；稽核进度与分片状态、本次响应在同一条原子 UPDATE 中提交，重试只重放原结果、
+  竞争 / 解码失败不增加异常也不推进基准，重启后续传。
 - **结果复用**：同一协议版本 + 输入字节 SHA-256 摘要命中 SQLite 缓存，响应中
   `cached=true`。
 - **结构化错误**：字段越界、协议歧义、非法协议声明均返回统一错误信封的 HTTP 422。
@@ -212,6 +221,8 @@ curl -s -X POST localhost:8000/sessions -H 'Content-Type: application/json' -d '
   "version": 1
 }'
 ```
+
+> 可选参数 `"enable_sequence_audit": true` 开启序号连续性稽核（详见 [4.7](#47-序号连续性稽核可选启用)）。
 
 响应：
 
@@ -424,6 +435,159 @@ curl -s -X POST localhost:8001/sessions/append -H 'Content-Type: application/jso
 `docker compose up --build` 单实例启动方式保持不变（命名卷 `resync-data` 内的数据库文件同样
 可以直接挂给第二个容器实例共用）。
 
+#### 4.7 序号连续性稽核（可选启用）
+
+需要对单序列采集流做序号稽核时，在创建会话时打开
+`enable_sequence_audit`。协议必须声明 `sequence_field`，且该字段是**有效位宽至少两位的
+无符号整数**：整字节无符号字段（`u8/u16/u24/u32/u64`）天然满足；位域字段按
+`bit_width` 判定（≥2）；有符号字段（`s8` 等）、1 位字段或未声明 `sequence_field`
+的协议一律 422 `SEQUENCE_AUDIT_UNSUPPORTED`，会话不创建。原有会话与不带该参数（默认
+`false`）的会话行为完全不变。
+
+**启用：**
+
+```bash
+curl -s -X POST localhost:8000/sessions -H 'Content-Type: application/json' -d '{
+  "protocol_id": "sensor-line",
+  "version": 1,
+  "enable_sequence_audit": true
+}'
+```
+
+响应中的 `sequence_audit` 给出稽核配置与初始状态：
+
+```json
+{
+  "session_id": "a1b2c3…",
+  "protocol_id": "sensor-line",
+  "version": 1,
+  "received_offset": 0,
+  "next_offset": 0,
+  "tail": {"start": 0, "end": 0, "payload_b64": ""},
+  "frames_total": 0,
+  "sequence_audit": {
+    "enabled": true,
+    "sequence_field": "seq",
+    "bit_width": 8,
+    "last_sequence": null,
+    "anomalies": [],
+    "counts": {"duplicate": 0, "suspected_gap": 0, "backward": 0, "direction_unknown": 0}
+  }
+}
+```
+
+**判定规则（以 `bit_width=8`、模数 256 为例）：** 每次成功追加只检查**本次新确认的有效帧**，
+与比较基准（上一个有效帧的序号）按序号字段位宽取模比较：
+
+| 模 256 的前进量 | 判定 | 含义 |
+| --- | --- | --- |
+| 0 | `duplicate` | 序号与上一帧相同 |
+| 1 | 正常 | 连续，无异常 |
+| 2 … 127 | `suspected_gap` | 疑似缺帧，`missing_count = 前进量 - 1` |
+| 128（恰好半圈） | `direction_unknown` | 无法判向，**不**推断缺帧 |
+| 129 … 255 | `backward` | 视为倒退，**不**推断缺帧 |
+
+每个有效帧（包括被判为异常的帧）都成为下一帧的比较基准；**坏帧**（长度越界 / CRC 失败等被
+跳过的候选）与**未决尾部**根本不会成为有效帧，因此不推进基准、不计异常。第一个有效帧只建立
+基准，不产生异常。
+
+**跨分片：** 稽核基准（最近序号）与各类累计次数随会话状态持久化，被拆开的帧只在补齐那一片
+被稽核一次。下例中第 1 片确认序号 0、2（缺了序号 1），随后一个序号 3 的帧被拆成两片：
+
+```bash
+# 第 1 片：seq 0, 2
+curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/json' -d '{
+  "session_id": "a1b2c3…",
+  "expected_offset": 0,
+  "chunk_b64": "qlECA…（含 seq=0 与 seq=2 两帧）"
+}'
+```
+
+```json
+{
+  "frames": [ {"sequence": 0, "start": 0, "end": 11, …},
+              {"sequence": 2, "start": 11, "end": 22, …} ],
+  "frame_count": 2,
+  "frames_total": 2,
+  "next_offset": 22,
+  "replayed": false,
+  "sequence_audit": {
+    "enabled": true,
+    "sequence_field": "seq",
+    "bit_width": 8,
+    "last_sequence": 2,
+    "anomalies": [
+      {"frame_offset": 11, "frame_end": 22, "previous_sequence": 0,
+       "sequence": 2, "type": "suspected_gap", "missing_count": 1}
+    ],
+    "counts": {"duplicate": 0, "suspected_gap": 1, "backward": 0, "direction_unknown": 0}
+  }
+}
+```
+
+```bash
+# 第 2 片只发来序号 3 帧的前半（帧在累计偏移 22 处开始，仍在 tail 中）
+curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/json' -d '{
+  "session_id": "a1b2c3…", "expected_offset": 22, "chunk_b64": "qlUD…（半帧）"
+}'
+# -> frame_count 0，sequence_audit.last_sequence 仍为 2，anomalies 为空
+
+# 第 3 片补齐该帧：仅在此时与基准序号 2 比较（2 -> 3 连续，无异常）
+curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/json' -d '{
+  "session_id": "a1b2c3…", "expected_offset": 26, "chunk_b64": "…（帧剩余部分）"
+}'
+# -> sequence_audit.anomalies 为 []，last_sequence 更新为 3
+```
+
+序号回绕（如 8 位宽下 255 → 0、16 位宽下 65535 → 0）视为正常前进一步。
+
+**重试：** 最近分片按同一 `expected_offset` 与完全相同内容重发时，服务只重放已提交的原响应
+（`replayed: true`），其中的 `sequence_audit` 与首次响应逐字一致，**异常不重复累计、基准不
+重复推进**：
+
+```bash
+curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/json' -d '{
+  "session_id": "a1b2c3…", "expected_offset": 0,
+  "chunk_b64": "qlECA…（与第 1 片完全相同）"
+}'
+# -> 200, "replayed": true, sequence_audit.counts.suspected_gap 仍为 1
+```
+
+同偏移不同内容 / 乱序跳跃 / 并发竞争（409 `SESSION_APPEND_CONFLICT`）、拼合超限（413）或
+解码硬错（422，如 `AMBIGUOUS_FRAME`）一律不改任何稽核状态：异常次数不增加、`last_sequence`
+不推进，修正后用同一偏移重发即可。多个实例共用同一 SQLite 时，稽核进度与接收偏移、尾部、
+帧数、最近分片及原响应在**同一条以接收偏移为守卫的原子 UPDATE** 中落库，竞争落败方不计数、
+不改基准。
+
+**进度查询：** `GET /sessions/{id}` 的 `sequence_audit` 给出最近确认序号与各类**累计**异常
+次数（`anomalies` 恒为空数组，逐次异常只在对应的追加响应里返回）：
+
+```bash
+curl -s localhost:8000/sessions/a1b2c3…
+```
+
+```json
+{
+  "received_offset": 44,
+  "next_offset": 44,
+  "frames_total": 4,
+  "sequence_audit": {
+    "enabled": true,
+    "sequence_field": "seq",
+    "bit_width": 8,
+    "last_sequence": 5,
+    "anomalies": [],
+    "counts": {"duplicate": 0, "suspected_gap": 2, "backward": 0, "direction_unknown": 0}
+  },
+  …
+}
+```
+
+服务重启后稽核进度从 SQLite 恢复：先按 `last_chunk_offset` 重放未确认分片拿到原响应，再以
+持久化的 `last_sequence` 为基准继续追加。未启用稽核的会话，创建 / 追加 / 进度响应中的
+`sequence_audit` 为 `null`（进度与追加）或缺省（创建），其余行为与旧版一致；旧版本数据库
+文件首次被新版服务打开时会自动补列迁移。
+
 ## 协议声明字段
 
 | 字段 | 说明 |
@@ -434,7 +598,7 @@ curl -s -X POST localhost:8001/sessions/append -H 'Content-Type: application/jso
 | `escaping` | DLE 转义：`escape_byte`、`xor_mask`（转义后字节 = 原字节 XOR mask）、`escapes_sync`、额外受保护字节 `escaped_bytes` |
 | `crc` | CRC-16 参数与 `offset`（2 字节 CRC 在逻辑体中的偏移）、`endian`、`verify` |
 | `fields[]` | `type` 为 `u8/u16/u24/u32/u64/s8/s16/s24/s32/s64`；定点值 = 整数 × `scale` ÷ `divisor`；可选 `bit_offset`+`bit_width` 取位域，`min`/`max` 做范围校验 |
-| `sequence_field` | 指定作为帧序号的字段名（响应中的 `sequence`） |
+| `sequence_field` | 指定作为帧序号的字段名（响应中的 `sequence`；启用会话序号稽核时必须是有效位宽 ≥2 位的无符号整数） |
 | `min/max_frame_length` | 逻辑帧长上下界；越界候选触发重同步 |
 
 ### 转义语义
@@ -467,6 +631,7 @@ curl -s -X POST localhost:8001/sessions/append -H 'Content-Type: application/jso
 | 404 | `PROTOCOL_NOT_FOUND` | 协议 ID / 版本不存在 |
 | 409 | `PROTOCOL_VERSION_CONFLICT` | 同 ID+版本已存在但定义不同 |
 | 404 | `SESSION_NOT_FOUND` | 会话 ID 不存在（追加或进度查询） |
+| 422 | `SEQUENCE_AUDIT_UNSUPPORTED` | 创建会话启用序号稽核，但协议未声明 `sequence_field`、字段有符号或有效位宽不足两位（`details.reason`：`missing_sequence_field` / `signed_sequence_field` / `sequence_field_too_narrow`） |
 | 409 | `SESSION_APPEND_CONFLICT` | 会话追加：同偏移不同内容（`reason=content_mismatch`）或乱序/跳跃/并发提交（`reason=offset_mismatch`），状态不变 |
 | 413 | `PAYLOAD_TOO_LARGE` | 超 `RESYNC_MAX_DECODE_BYTES`（会话中指 待决尾部 + 新分片 的拼合大小） |
 
@@ -480,9 +645,9 @@ curl -s -X POST localhost:8001/sessions/append -H 'Content-Type: application/jso
 | `GET` | `/protocols/{id}?version=N` | 读取协议定义（省略版本取最新） |
 | `POST` | `/decode` | 解码 / 重同步 |
 | `POST` | `/encode` | 按已注册协议编码一帧（长度/CRC/转义/同步自动生成，回读校验） |
-| `POST` | `/sessions` | 创建分批采集会话（固定协议的确切版本） |
-| `POST` | `/sessions/append` | 追加非空 base64 分片（尾部自动拼接，仅返回本次新结果） |
-| `GET` | `/sessions/{id}` | 查询会话进度（偏移/待决尾部/累计帧数/最近一次分片） |
+| `POST` | `/sessions` | 创建分批采集会话（固定协议的确切版本；`enable_sequence_audit:true` 可选启用序号连续性稽核） |
+| `POST` | `/sessions/append` | 追加非空 base64 分片（尾部自动拼接，仅返回本次新结果；启用稽核时 `sequence_audit` 给出本次异常） |
+| `GET` | `/sessions/{id}` | 查询会话进度（偏移/待决尾部/累计帧数/最近一次分片；启用稽核时含最近序号与累计异常次数） |
 
 同 ID + 版本重复提交**完全相同**的定义是幂等的（返回 `replaced=true`）；定义不同则 409。
 
@@ -495,7 +660,8 @@ app/
   crc.py       # 通用 CRC-16（反射/非反射）
   decoder.py   # 候选扫描、反转义、长度/CRC 校验、重同步与歧义判定
   encoder.py   # 字段写入（位域/定点反算/冲突检测）、长度与 CRC 派生、转义、回读校验
-  db.py        # SQLite：协议表 + (协议版本, 输入摘要) 结果缓存 + 采集会话状态表
+  db.py            # SQLite：协议表 + (协议版本, 输入摘要) 结果缓存 + 采集会话状态表（含序号稽核进度）
+  sequence_audit.py # 序号字段有效位宽校验与模 2^w 连续性分类（重复/疑似缺帧/倒退/无法判向）
   errors.py    # 结构化错误类型
   main.py      # FastAPI 路由与错误处理（/decode、/encode、/sessions[/append]）
 tests/         # pytest 用例（含构造 CRC 碰撞的歧义用例、编码回读校验、会话跨分片/重试/重启）
@@ -524,3 +690,8 @@ dangling 转义符）只产出一次且偏移为累计位置、最近分片同�
 同偏移竞争恰有一个提交、落败方 409 `content_mismatch` 且状态只反映胜方；相同分片竞争一个
 提交一个重放、不重复计帧；活跃实例间交替追加与进度互见；新实例（模拟重启）读取进度、重放
 最近分片并继续追加。
+序号稽核侧（`tests/test_sequence_audit.py`）覆盖：缺序号字段 / 有符号 / 1 位宽 422 拒绝、
+2 位与 8/16 位宽下的重复、疑似缺帧（含 `missing_count`）、超过/恰好半圈（倒退 / 无法判向）
+与回绕连续、坏 CRC 帧与未决尾部不推进基准、异常帧自身成为基准、跨分片拆分只稽核一次、
+重试重放不重复计数、冲突 / 超限 / 歧义硬错不改稽核状态、重启后基准与累计次数续传、旧版
+数据库自动迁移，以及多实例竞争下稽核状态只反映胜方。

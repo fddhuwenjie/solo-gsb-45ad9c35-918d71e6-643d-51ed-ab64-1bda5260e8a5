@@ -38,10 +38,32 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_chunk_offset INTEGER,
     last_chunk_sha256 TEXT,
     last_response     TEXT NOT NULL,
+    seq_audit_enabled INTEGER NOT NULL DEFAULT 0,
+    seq_field_name    TEXT,
+    seq_bit_width     INTEGER,
+    last_sequence     INTEGER,
+    seq_dup_count     INTEGER NOT NULL DEFAULT 0,
+    seq_gap_count     INTEGER NOT NULL DEFAULT 0,
+    seq_back_count    INTEGER NOT NULL DEFAULT 0,
+    seq_dir_count     INTEGER NOT NULL DEFAULT 0,
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
+
+# Columns added for the optional sequence continuity audit; older database
+# files (created before the audit existed) get them through this migration so
+# sessions already on disk keep working untouched.
+_SESSION_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("seq_audit_enabled", "INTEGER NOT NULL DEFAULT 0"),
+    ("seq_field_name", "TEXT"),
+    ("seq_bit_width", "INTEGER"),
+    ("last_sequence", "INTEGER"),
+    ("seq_dup_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("seq_gap_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("seq_back_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("seq_dir_count", "INTEGER NOT NULL DEFAULT 0"),
+)
 
 _init_lock = threading.Lock()
 _initialized: set[str] = set()
@@ -64,6 +86,15 @@ def init_db(db_path: str) -> None:
         conn = _connect(db_path)
         try:
             conn.executescript(_SCHEMA)
+            # Migrate database files created by older versions: add the audit
+            # columns that are missing, leaving pre-existing sessions disabled.
+            existing = {
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            for name, decl in _SESSION_ADDED_COLUMNS:
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE sessions ADD COLUMN {name} {decl}")
             conn.commit()
         finally:
             conn.close()
@@ -149,14 +180,31 @@ class Database:
 
     # ----- collection sessions ---------------------------------------------
 
-    def create_session(self, session_id: str, protocol_id: str, version: int) -> None:
+    def create_session(
+        self,
+        session_id: str,
+        protocol_id: str,
+        version: int,
+        *,
+        seq_field_name: str | None = None,
+        seq_bit_width: int | None = None,
+    ) -> None:
+        enabled = seq_field_name is not None
         with self.conn:
             self.conn.execute(
                 "INSERT INTO sessions "
                 "(session_id, protocol_id, version, received_offset, tail_b64, "
-                " frames_total, last_chunk_offset, last_chunk_sha256, last_response) "
-                "VALUES (?, ?, ?, 0, '', 0, NULL, NULL, '')",
-                (session_id, protocol_id, version),
+                " frames_total, last_chunk_offset, last_chunk_sha256, last_response, "
+                " seq_audit_enabled, seq_field_name, seq_bit_width) "
+                "VALUES (?, ?, ?, 0, '', 0, NULL, NULL, '', ?, ?, ?)",
+                (
+                    session_id,
+                    protocol_id,
+                    version,
+                    1 if enabled else 0,
+                    seq_field_name,
+                    seq_bit_width,
+                ),
             )
 
     def get_session(self, session_id: str) -> sqlite3.Row | None:
@@ -176,12 +224,18 @@ class Database:
         last_chunk_offset: int,
         last_chunk_sha: str,
         last_response_json: str,
+        last_sequence: int | None = None,
+        seq_dup_count: int = 0,
+        seq_gap_count: int = 0,
+        seq_back_count: int = 0,
+        seq_dir_count: int = 0,
     ) -> bool:
         """Durably commit one accepted append; returns True when it won.
 
-        Offset, tail, frame count, last chunk and its response move together
-        in a single statement, so they take effect as one state and a
-        crash/restart never loses or duplicates work.
+        Offset, tail, frame count, last chunk, its response and the audit
+        progress (latest baseline sequence and cumulative anomaly counts)
+        move together in a single statement, so they take effect as one
+        state and a crash/restart never loses or duplicates work.
 
         The UPDATE doubles as a compare-and-swap: it only applies while the
         session's committed ``received_offset`` is still the one this append
@@ -198,6 +252,8 @@ class Database:
                 "UPDATE sessions SET "
                 "received_offset = ?, tail_b64 = ?, frames_total = ?, "
                 "last_chunk_offset = ?, last_chunk_sha256 = ?, last_response = ?, "
+                "last_sequence = ?, seq_dup_count = ?, seq_gap_count = ?, "
+                "seq_back_count = ?, seq_dir_count = ?, "
                 "updated_at = datetime('now') "
                 "WHERE session_id = ? AND received_offset = ?",
                 (
@@ -207,6 +263,11 @@ class Database:
                     last_chunk_offset,
                     last_chunk_sha,
                     last_response_json,
+                    last_sequence,
+                    seq_dup_count,
+                    seq_gap_count,
+                    seq_back_count,
+                    seq_dir_count,
                     session_id,
                     expected_received_offset,
                 ),

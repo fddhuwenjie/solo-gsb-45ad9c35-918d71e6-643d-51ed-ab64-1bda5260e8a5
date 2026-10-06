@@ -355,6 +355,38 @@ class CreateSessionRequest(BaseModel):
     version: int = Field(
         ..., ge=1, description="Exact registered protocol version pinned to this session"
     )
+    enable_sequence_audit: bool = Field(
+        False,
+        description="Opt into sequence-number continuity auditing; the pinned protocol "
+        "must then declare an unsigned sequence_field at least 2 bits wide",
+    )
+
+
+class SequenceAnomaly(BaseModel):
+    frame_offset: int = Field(..., description="Session byte offset where the anomalous frame starts")
+    frame_end: int = Field(..., description="Exclusive session byte offset of the anomalous frame")
+    previous_sequence: int = Field(..., description="Raw sequence number of the baseline frame")
+    sequence: int = Field(..., description="Raw (modulo) sequence number of the anomalous frame")
+    type: Literal["duplicate", "suspected_gap", "backward", "direction_unknown"]
+    missing_count: int | None = Field(
+        None, description="Inferred number of missing frames (suspected_gap only)"
+    )
+
+
+class SequenceAuditSummary(BaseModel):
+    enabled: bool
+    sequence_field: str
+    bit_width: int = Field(..., ge=2, description="Effective unsigned bit width of the sequence field")
+    last_sequence: int | None = Field(
+        None, description="Sequence number of the most recently confirmed valid frame"
+    )
+    anomalies: list[SequenceAnomaly] = Field(
+        default_factory=list, description="Anomalies found among this append's newly confirmed frames"
+    )
+    counts: dict[str, int] = Field(
+        default_factory=dict,
+        description="Session-wide cumulative anomaly counts by type after this append",
+    )
 
 
 class SessionAppendRequest(BaseModel):
@@ -388,6 +420,9 @@ class SessionAppendResponse(BaseModel):
         description="True when the identical chunk at the identical offset is resent: "
         "the stored response is returned verbatim and no frames are produced again",
     )
+    sequence_audit: SequenceAuditSummary | None = Field(
+        None, description="Continuity-audit result for this append; null when the audit is disabled"
+    )
 
 
 class SessionProgressResponse(BaseModel):
@@ -400,5 +435,10 @@ class SessionProgressResponse(BaseModel):
     frames_total: int
     last_chunk_offset: int | None
     last_chunk_sha256: str | None
+    sequence_audit: SequenceAuditSummary | None = Field(
+        None,
+        description="Latest confirmed sequence number and cumulative anomaly counts; "
+        "null for sessions created without the audit",
+    )
     created_at: str
     updated_at: str
